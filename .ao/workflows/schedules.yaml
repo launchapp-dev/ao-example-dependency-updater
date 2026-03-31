@@ -1,0 +1,10 @@
+schedules:
+  - id: weekly-scan
+    cron: "0 9 * * 1"
+    workflow_ref: dependency-scan
+    enabled: true
+
+  - id: daily-audit
+    cron: "0 8 * * *"
+    workflow_ref: quick-audit
+    enabled: true

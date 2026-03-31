@@ -1,0 +1,292 @@
+phases:
+  scan-outdated:
+    mode: command
+    command:
+      program: bash
+      args: ["-c", "scripts/scan-outdated.sh"]
+      cwd_mode: project_root
+      timeout_secs: 120
+    capabilities:
+      mutates_state: false
+      writes_files: true
+
+  classify-updates:
+    mode: agent
+    agent: scanner
+    directive: |
+      Read the raw scan output from data/scan-results.json (npm outdated output) and
+      data/audit-results.json (npm audit output).
+
+      Classify every outdated package and produce data/classified-updates.json with this structure:
+      {
+        "scanned_at": "<ISO timestamp>",
+        "total_outdated": <number>,
+        "packages": [
+          {
+            "name": "<package-name>",
+            "current": "<current-version>",
+            "wanted": "<wanted-version>",
+            "latest": "<latest-version>",
+            "update_type": "patch|minor|major",
+            "category": "runtime|dev|peer|optional",
+            "has_cve": true|false,
+            "cve_ids": ["CVE-XXXX-XXXX"]
+          }
+        ]
+      }
+
+      If data/scan-results.json is empty or shows no outdated packages, output:
+      { "verdict": "up-to-date", "reason": "All packages are at their latest versions" }
+      and emit verdict "up-to-date".
+
+      Otherwise emit verdict "has-updates".
+    capabilities:
+      mutates_state: false
+      writes_files: true
+    decision_contract:
+      required_fields: [verdict]
+      valid_verdicts: [up-to-date, has-updates]
+
+  assess-risk:
+    mode: agent
+    agent: risk-assessor
+    directive: |
+      Read data/classified-updates.json. For every package with update_type "major" or "minor",
+      perform a structured risk assessment using sequential-thinking.
+
+      Use the fetch MCP server to look up:
+      - The package's CHANGELOG.md or GitHub releases page
+      - Any migration guides for the version being upgraded to
+      - Known issues with this version (GitHub issues search)
+
+      Produce data/risk-assessment.json:
+      {
+        "assessed_at": "<ISO timestamp>",
+        "overall_risk": "safe|mixed|high-risk",
+        "packages": [
+          {
+            "name": "<package-name>",
+            "from": "<current-version>",
+            "to": "<latest-version>",
+            "risk_score": "low|medium|high|critical",
+            "breaking_changes": ["<description>"],
+            "migration_notes": "<steps to migrate>",
+            "changelog_url": "<URL if found>",
+            "reasoning": "<your analysis>"
+          }
+        ]
+      }
+
+      Patches with no CVE are always "low" risk — do not research them.
+      Focus your research time on majors and any minor with a history of breaking changes.
+
+      Emit verdict based on overall_risk:
+      - "safe" if overall_risk is safe
+      - "mixed" if overall_risk is mixed
+      - "high-risk" if overall_risk is high-risk
+    capabilities:
+      mutates_state: false
+      writes_files: true
+    decision_contract:
+      required_fields: [verdict, reasoning]
+      valid_verdicts: [safe, mixed, high-risk]
+
+  plan-updates:
+    mode: agent
+    agent: update-planner
+    directive: |
+      Read data/classified-updates.json and data/risk-assessment.json.
+
+      Create a batched update plan saved to data/update-plan.json:
+      {
+        "planned_at": "<ISO timestamp>",
+        "total_packages": <number>,
+        "batches": [
+          {
+            "batch_number": 1,
+            "name": "Security Patches",
+            "rationale": "<why these are grouped>",
+            "packages": [
+              { "name": "<pkg>", "from": "<ver>", "to": "<ver>", "update_type": "patch" }
+            ],
+            "expected_peer_changes": [],
+            "rollback_cmd": "git revert HEAD~1"
+          }
+        ]
+      }
+
+      Rules:
+      1. Batch 1: packages with has_cve=true (security first, always)
+      2. Batch 2: patch updates with risk_score=low
+      3. Batch 3: minor updates with risk_score=low or medium, grouped by ecosystem
+      4. Batch 4+: one batch per major update or high/critical risk package
+
+      Within each batch, order to respect peer dependency constraints (install host packages before plugins).
+      Document the rollback command for each batch as a git revert of that batch's commit.
+    capabilities:
+      mutates_state: false
+      writes_files: true
+
+  apply-updates:
+    mode: agent
+    agent: updater
+    directive: |
+      Read data/update-plan.json and config/targets.json.
+
+      Execute the update plan:
+      1. Use GitHub MCP to create branch "deps/update-{{subject_title}}-<YYYYMMDD>" from main
+      2. For each batch in the plan:
+         a. Read the current package.json from the target repo path (config/targets.json[0].path)
+         b. Update each package's version range to the target version
+            - For patches and minors: use "^<target-version>"
+            - For majors: use "^<major>.0.0" to allow minor/patch within the new major
+         c. Write the updated package.json back
+         d. Commit with message: "deps(batch-<N>): <batch-name> — <package-list>"
+      3. Track all changes in data/applied-updates.json
+
+      If a version conflict prevents updating a package (peer dep requires older version):
+      - Document the conflict clearly
+      - Skip that package and add it to the "conflicts" list
+      - Continue with remaining packages in the batch
+
+      Output data/applied-updates.json:
+      {
+        "branch": "<branch-name>",
+        "applied_at": "<ISO timestamp>",
+        "batches_applied": <number>,
+        "total_updated": <number>,
+        "total_skipped": <number>,
+        "conflicts": [],
+        "batches": [{ "batch_number": 1, "packages_updated": [], "commit_message": "..." }]
+      }
+    capabilities:
+      mutates_state: true
+      writes_files: true
+      requires_commit: false
+
+  run-tests:
+    mode: command
+    command:
+      program: bash
+      args: ["-c", "scripts/run-tests.sh"]
+      cwd_mode: project_root
+      timeout_secs: 300
+    capabilities:
+      mutates_state: false
+      writes_files: true
+
+  analyze-test-results:
+    mode: agent
+    agent: test-runner-analyst
+    directive: |
+      Read data/test-output.txt, data/test-result.json, and config/known-flaky-tests.json.
+
+      Classify the test run:
+      1. Check the exit code in data/test-result.json
+      2. Parse data/test-output.txt for individual test pass/fail status
+      3. For each failure, check if it matches any pattern in known-flaky-tests.json
+      4. Determine the root cause: is it a real regression from the dependency updates?
+
+      Write data/test-analysis.json:
+      {
+        "analyzed_at": "<ISO timestamp>",
+        "verdict": "passing|flaky|failing|broken",
+        "exit_code": <number>,
+        "total_tests": <number>,
+        "passed": <number>,
+        "failed": <number>,
+        "flaky_count": <number>,
+        "failures": [
+          {
+            "test_name": "<test>",
+            "error": "<error message>",
+            "is_flaky": true|false,
+            "likely_caused_by": "<package name if applicable>"
+          }
+        ],
+        "rollback_recommendation": "<which batch to rollback, if failing>",
+        "notes": "<any additional context>"
+      }
+
+      Emit verdict:
+      - "passing": exit code 0 OR all failures are flaky
+      - "flaky": non-zero exit but all failures match known-flaky patterns
+      - "failing": non-zero exit with real (non-flaky) failures
+      - "broken": test runner itself crashed (cannot parse test output at all)
+    capabilities:
+      mutates_state: false
+      writes_files: true
+    decision_contract:
+      required_fields: [verdict, reasoning]
+      valid_verdicts: [passing, flaky, failing, broken]
+
+  create-pr:
+    mode: agent
+    agent: pr-author
+    directive: |
+      Read all data files and compose a comprehensive pull request.
+
+      Required files to read:
+      - data/classified-updates.json
+      - data/risk-assessment.json (if exists)
+      - data/update-plan.json
+      - data/applied-updates.json
+      - data/test-analysis.json
+      - config/policy.json
+
+      PR title: "chore(deps): update <N> packages (<YYYY-MM-DD>)"
+
+      PR body structure:
+      1. ## Summary — one-paragraph overview with package count, risk level, test status
+      2. ## Security Fixes (if any CVEs) — list CVE IDs and affected packages, **bold and prominent**
+      3. ## Changes — markdown table: Package | From | To | Type | Risk
+      4. ## Batch Details — per-batch breakdown with ecosystem grouping rationale
+      5. ## Breaking Changes — for any major updates, list breaking APIs with migration steps
+      6. ## Test Results — emoji summary (✅ passing / ⚠️ flaky / ❌ failing)
+      7. ## Rollback — exact git commands to revert if issues arise after merge
+
+      After creating the PR via GitHub MCP, also:
+      - Set labels: "dependencies", plus "security" if CVEs, plus "breaking-change" if majors
+      - Write output/pr-summary.json with { "pr_url": "...", "pr_number": N, "packages_updated": N }
+      - Write output/audit-report.md as a standalone markdown document for record-keeping
+
+      If config/policy.json has auto_merge.patch = true and all updates are patches, note that
+      this PR is eligible for auto-merge.
+    capabilities:
+      mutates_state: false
+      writes_files: true
+
+  generate-audit-report:
+    mode: agent
+    agent: pr-author
+    directive: |
+      Read data/classified-updates.json and data/risk-assessment.json (if it exists, run assess-risk first
+      if not present).
+
+      Generate a standalone audit report at output/audit-report.md. This report does NOT create a PR —
+      it is a read-only summary for the team to review.
+
+      Report structure:
+      # Dependency Audit Report — <YYYY-MM-DD>
+
+      ## Executive Summary
+      - Total packages outdated: N
+      - Security issues: N CVEs
+      - Risk breakdown: N low / N medium / N high
+
+      ## Outdated Packages
+      Table: Package | Current | Latest | Type | Risk | CVEs
+
+      ## Recommended Actions
+      - Immediate: List security patches that should be applied ASAP
+      - This week: List low-risk patches and minors
+      - Planned: List high-risk majors that need manual review
+
+      ## Security Details
+      For each CVE: CVE ID, severity, affected versions, fix version, description
+
+      Write output/audit-report.md with the full report.
+      Do NOT create any PRs or modify any code.
+    capabilities:
+      mutates_state: false
+      writes_files: true

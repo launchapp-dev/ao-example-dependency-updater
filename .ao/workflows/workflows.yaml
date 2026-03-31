@@ -1,0 +1,53 @@
+default_workflow_ref: dependency-scan
+
+workflows:
+  - id: dependency-scan
+    name: "Full Dependency Update Pipeline"
+    description: "Scans repos for outdated packages, assesses risk, applies updates in batches, runs tests, and opens a PR"
+    phases:
+      - scan-outdated
+      - classify-updates:
+          on_verdict:
+            up-to-date:
+              target: null
+      - assess-risk:
+          on_verdict:
+            safe:
+              target: plan-updates
+            mixed:
+              target: plan-updates
+            high-risk:
+              target: plan-updates
+      - plan-updates
+      - apply-updates
+      - run-tests
+      - analyze-test-results:
+          on_verdict:
+            passing:
+              target: create-pr
+            flaky:
+              target: create-pr
+            failing:
+              target: apply-updates
+            broken:
+              target: null
+          max_rework_attempts: 3
+      - create-pr
+    post_success:
+      merge:
+        strategy: squash
+        target_branch: main
+        create_pr: true
+        auto_merge: false
+        cleanup_worktree: true
+
+  - id: quick-audit
+    name: "Quick Dependency Audit"
+    description: "Lightweight scan that reports outdated packages and risk levels — no updates applied, no PRs created"
+    phases:
+      - scan-outdated
+      - classify-updates:
+          on_verdict:
+            up-to-date:
+              target: null
+      - generate-audit-report

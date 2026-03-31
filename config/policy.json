@@ -1,0 +1,25 @@
+{
+  "auto_merge": {
+    "patch": true,
+    "minor": false,
+    "major": false
+  },
+  "security": {
+    "auto_merge_critical_patches": true,
+    "block_on_high_severity_cve": true
+  },
+  "batching": {
+    "max_packages_per_pr": 20,
+    "group_by_ecosystem": true,
+    "isolate_major_updates": true
+  },
+  "testing": {
+    "required_before_pr": true,
+    "max_rework_attempts": 3
+  },
+  "pr": {
+    "labels": ["dependencies"],
+    "assign_to": "",
+    "reviewers": []
+  }
+}

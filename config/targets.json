@@ -1,0 +1,18 @@
+{
+  "repos": [
+    {
+      "name": "my-app",
+      "path": "./target-repo",
+      "test_command": "npm test",
+      "package_manager": "npm",
+      "auto_merge_policy": "patch-only",
+      "github_repo": "my-org/my-app",
+      "default_branch": "main"
+    }
+  ],
+  "scan_options": {
+    "include_dev": true,
+    "include_optional": false,
+    "ignore_packages": []
+  }
+}

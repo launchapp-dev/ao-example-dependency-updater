@@ -1,0 +1,4 @@
+{
+  "description": "Tests known to be flaky — failures matching these patterns are ignored during dependency update CI",
+  "patterns": []
+}
